@@ -1,0 +1,20 @@
+{
+  "total_steps": 20,
+  "warmup_steps": 2,
+  "peak_lr": 0.0002,
+  "minimum_lr_ratio": 0.1,
+  "micro_batch_size": 8,
+  "gradient_accumulation_steps": 1,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.95,
+  "gradient_clip": 1.0,
+  "validation_interval": 20,
+  "checkpoint_interval": 20,
+  "seed": 2026,
+  "num_workers": 8,
+  "prefetch_factor": 2,
+  "pin_memory": true,
+  "context_patches": 30,
+  "precision": "bf16"
+}

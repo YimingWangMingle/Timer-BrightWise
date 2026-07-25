@@ -1,0 +1,11 @@
+{
+  "steps": 100,
+  "batch_size": 8,
+  "learning_rate": 0.003,
+  "weight_decay": 0.01,
+  "grad_clip": 1.0,
+  "num_samples": 64,
+  "context_patches": 4,
+  "seed": 2026,
+  "log_every": 10
+}
