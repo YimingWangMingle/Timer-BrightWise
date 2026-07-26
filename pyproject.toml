@@ -10,7 +10,7 @@ dependencies = ["numpy>=1.26,<3", "torch>=2.3,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
-server = ["datasets>=3,<5", "psutil>=6,<8", "tqdm>=4.66,<5"]
+server = ["datasets>=3,<4", "pyarrow>=20,<21", "psutil>=7,<8", "tqdm>=4.67,<5"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
