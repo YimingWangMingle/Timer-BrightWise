@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from tsfm.metrics import denormalized_error_metrics
+from tsfm.s3.sampling import CounterSampler
 
 
 def evaluate_model(
@@ -17,10 +19,19 @@ def evaluate_model(
     batch_size: int,
     batches: int,
     precision: str,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> dict[str, float]:
     if batch_size <= 0 or batches <= 0:
         raise ValueError("batch_size and batches must be positive")
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    if world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError("invalid validation rank or world_size")
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=CounterSampler(0, rank=rank, world_size=world_size),
+        num_workers=0,
+    )
     was_training = model.training
     model.eval()
     totals = {"normalized_mse": 0.0, "mse": 0.0, "mae": 0.0}
@@ -31,9 +42,7 @@ def evaluate_model(
         else contextlib.nullcontext()
     )
     with torch.no_grad():
-        for batch_index, batch in enumerate(loader):
-            if batch_index >= batches:
-                break
+        for batch in itertools.islice(loader, batches):
             context = batch["context"].to(device)
             target = batch["target"].to(device)
             with autocast:
@@ -54,4 +63,15 @@ def evaluate_model(
     model.train(was_training)
     if seen == 0:
         raise ValueError("validation dataset produced no batches")
-    return {name: value / seen for name, value in totals.items()}
+    aggregate = torch.tensor(
+        [totals["normalized_mse"], totals["mse"], totals["mae"], seen],
+        dtype=torch.float64,
+        device=device,
+    )
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(aggregate, op=torch.distributed.ReduceOp.SUM)
+    total_seen = float(aggregate[3])
+    return {
+        name: float(aggregate[index]) / total_seen
+        for index, name in enumerate(("normalized_mse", "mse", "mae"))
+    }

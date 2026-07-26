@@ -19,6 +19,13 @@ def _write_validation(path: Path, entry: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def primary_validation_metric(views: dict[str, dict[str, float]]) -> float:
+    required = {"val_heldout", "val_temporal"}
+    if set(views) != required:
+        raise ValueError("both validation views are required for primary metric")
+    return sum(views[name]["normalized_mse"] for name in sorted(required)) / 2.0
+
+
 def run_validated_training(
     *, model: torch.nn.Module, train_dataset: Dataset,
     validation_datasets: dict[str, Dataset], training_config,
@@ -47,10 +54,10 @@ def run_validated_training(
         combined_losses.extend(report.losses); total_micro += report.micro_batches; total_optimizer += report.optimizer_steps
         current_step = endpoint; current_resume = output / f"step-{endpoint:06d}.pt"
         if world_size > 1 and torch.distributed.is_initialized(): torch.distributed.barrier()
-        views = {name: evaluate_model(model, dataset, device=device, batch_size=training_config.micro_batch_size, batches=validation_batches, precision=training_config.precision) for name, dataset in validation_datasets.items()}
-        metric = sum(values["mse"] for values in views.values()) / len(views)
+        views = {name: evaluate_model(model, dataset, device=device, batch_size=training_config.micro_batch_size, batches=validation_batches, precision=training_config.precision, rank=rank, world_size=world_size) for name, dataset in validation_datasets.items()}
+        metric = primary_validation_metric(views)
         if is_main_process:
-            entry = {"step": endpoint, "validation_mse": metric, "views": views}
+            entry = {"step": endpoint, "validation_normalized_mse": metric, "views": views}
             output.mkdir(parents=True, exist_ok=True); _write_validation(output / "validation-report.jsonl", entry)
             if metric < best_metric:
                 temporary = output / ".best.pt.tmp"; shutil.copyfile(current_resume, temporary); os.replace(temporary, output / "best.pt")
