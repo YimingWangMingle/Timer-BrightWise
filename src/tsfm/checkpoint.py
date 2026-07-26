@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.optim import Optimizer
+from tsfm.distributed import unwrap_model
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +21,7 @@ class TrainingState:
     sampler_state: dict[str, int]
 
 
-def _rng_state() -> dict[str, object]:
+def capture_rng_state() -> dict[str, object]:
     numpy_state = np.random.get_state()
     return {
         "python": random.getstate(),
@@ -65,18 +66,24 @@ def save_training_checkpoint(
     config_snapshots: dict[str, object],
     manifest_checksum: str,
     environment: dict[str, object],
+    rank_rng_states: dict[int, dict[str, object]] | None = None,
+    resolved_plan: dict[str, object] | None = None,
 ) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
+    local_rng = capture_rng_state()
+    rank_rng_states = rank_rng_states or {0: local_rng}
     torch.save(
         {
             "format_version": 1,
-            "model": model.state_dict(),
+            "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "training_state": asdict(state),
-            "rng": _rng_state(),
+            "rng": local_rng,
+            "rank_rng_states": rank_rng_states,
+            "resolved_plan": resolved_plan or {},
             "config_snapshots": config_snapshots,
             "manifest_checksum": manifest_checksum,
             "environment": {key: str(value) for key, value in environment.items()},
@@ -94,6 +101,9 @@ def load_training_checkpoint(
     scheduler,
     expected_config_snapshots: dict[str, object],
     expected_manifest_checksum: str,
+    rank: int = 0,
+    expected_world_size: int = 1,
+    expected_resolved_plan: dict[str, object] | None = None,
 ) -> TrainingState:
     payload = torch.load(Path(path), map_location="cpu", weights_only=True)
     if payload.get("format_version") != 1:
@@ -102,10 +112,18 @@ def load_training_checkpoint(
         raise ValueError("checkpoint configuration mismatch")
     if payload["manifest_checksum"] != expected_manifest_checksum:
         raise ValueError("checkpoint manifest checksum mismatch")
-    model.load_state_dict(payload["model"])
+    rank_states = payload.get("rank_rng_states", {0: payload["rng"]})
+    if len(rank_states) != expected_world_size or rank not in rank_states:
+        raise ValueError("checkpoint world-size or rank RNG mismatch")
+    if (
+        expected_resolved_plan is not None
+        and payload.get("resolved_plan", {}) != expected_resolved_plan
+    ):
+        raise ValueError("checkpoint resolved plan mismatch")
+    unwrap_model(model).load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
-    _restore_rng(payload["rng"])
+    _restore_rng(rank_states[rank])
     return TrainingState(**payload["training_state"])
 
 

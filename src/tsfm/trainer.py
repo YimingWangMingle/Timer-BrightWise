@@ -14,7 +14,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from tsfm.checkpoint import CheckpointManager, TrainingState, load_training_checkpoint, save_diagnostic
+from tsfm.checkpoint import (
+    CheckpointManager,
+    TrainingState,
+    capture_rng_state,
+    load_training_checkpoint,
+    save_diagnostic,
+)
 from tsfm.optim import build_optimizer, build_scheduler
 from tsfm.s3.sampling import CounterSampler
 from tsfm.train_config import TrainingConfig
@@ -49,7 +55,7 @@ def _autocast(device: torch.device, precision: str):
 
 
 def _loader(dataset: Dataset, config: TrainingConfig, consumed: int, rank: int, world_size: int) -> DataLoader:
-    return DataLoader(dataset, batch_size=config.micro_batch_size, sampler=CounterSampler(consumed, rank, world_size), num_workers=config.num_workers, pin_memory=config.pin_memory, prefetch_factor=config.prefetch_factor, persistent_workers=False)
+    return DataLoader(dataset, batch_size=config.micro_batch_size, sampler=CounterSampler(consumed, rank, world_size), num_workers=config.num_workers, pin_memory=config.pin_memory, prefetch_factor=config.prefetch_factor, persistent_workers=config.num_workers > 0)
 
 
 def bounded_batch_probe(model: torch.nn.Module, batch: dict[str, object], device: torch.device, precision: str = "bf16") -> dict[str, float]:
@@ -71,6 +77,20 @@ def _distributed_mean(value: float, device: torch.device, world_size: int) -> fl
     return float(tensor / world_size)
 
 
+def _gather_rank_rng_states(
+    *, rank: int, world_size: int
+) -> dict[int, dict[str, object]] | None:
+    local = capture_rng_state()
+    if world_size == 1 or not torch.distributed.is_initialized():
+        return {rank: local}
+    gathered = [None] * world_size if rank == 0 else None
+    torch.distributed.gather_object((rank, local), gathered, dst=0)
+    if rank != 0:
+        return None
+    assert gathered is not None
+    return {item_rank: state for item_rank, state in gathered}
+
+
 def run_training(*, model: torch.nn.Module, dataset: Dataset, training_config: TrainingConfig, output_dir: str | Path, manifest_checksum: str, config_snapshots: dict[str, object], device: torch.device, resume: str | Path | None = None, total_steps_override: int | None = None, rank: int = 0, world_size: int = 1, is_main_process: bool = True) -> TrainingReport:
     target_steps = total_steps_override or training_config.total_steps
     if not 0 < target_steps <= training_config.total_steps: raise ValueError("requested steps must be within configured total_steps")
@@ -87,13 +107,18 @@ def run_training(*, model: torch.nn.Module, dataset: Dataset, training_config: T
     started = time.perf_counter(); model.train()
     for step in range(state.global_step + 1, target_steps + 1):
         optimizer.zero_grad(set_to_none=True); accumulated = 0.0; last_batch = None
-        for _ in range(training_config.gradient_accumulation_steps):
+        for micro_step in range(training_config.gradient_accumulation_steps):
             batch = next(iterator); last_batch = batch; context = batch["context"].to(device, non_blocking=True); target = batch["target"].to(device, non_blocking=True)
-            with _autocast(device, training_config.precision): loss = model(context, labels=target).loss
-            if loss is None or not torch.isfinite(loss):
-                if is_main_process: save_diagnostic(output / "diagnostic.pt", step=step, loss=float("nan") if loss is None else float(loss.detach()), source_ids=list(batch["source_id"]), record_ids=list(batch["record_id"]), gradient_norm=None, config_paths={})
-                raise FloatingPointError(f"non-finite loss at step {step}; record_id={batch['record_id'][0]}")
-            loss_dtype = str(loss.dtype); (loss / training_config.gradient_accumulation_steps).backward(); accumulated += float(loss.detach()); micro_batches += 1
+            should_defer_sync = world_size > 1 and micro_step + 1 < training_config.gradient_accumulation_steps and hasattr(model, "no_sync")
+            sync_context = model.no_sync() if should_defer_sync else contextlib.nullcontext()
+            with sync_context:
+                with _autocast(device, training_config.precision): loss = model(context, labels=target).loss
+                if loss is None or not torch.isfinite(loss):
+                    if is_main_process: save_diagnostic(output / "diagnostic.pt", step=step, loss=float("nan") if loss is None else float(loss.detach()), source_ids=list(batch["source_id"]), record_ids=list(batch["record_id"]), gradient_norm=None, config_paths={})
+                    raise FloatingPointError(f"non-finite loss at step {step}; record_id={batch['record_id'][0]}")
+                loss_dtype = str(loss.dtype)
+                (loss / training_config.gradient_accumulation_steps).backward()
+            accumulated += float(loss.detach()); micro_batches += 1
             consumed += context.shape[0] * world_size; source_counts.update(str(item) for item in batch["source_id"])
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.gradient_clip)
         if not torch.isfinite(grad_norm):
@@ -102,8 +127,20 @@ def run_training(*, model: torch.nn.Module, dataset: Dataset, training_config: T
         optimizer.step(); scheduler.step()
         average_loss = _distributed_mean(accumulated / training_config.gradient_accumulation_steps, device, world_size); losses.append(average_loss)
         current_state = TrainingState(step, consumed, {"next_sample": consumed})
-        if is_main_process and manager is not None and (step % training_config.checkpoint_interval == 0 or step == target_steps):
-            last_path = manager.save(step=step, validation_metric=average_loss, model=model, optimizer=optimizer, scheduler=scheduler, state=current_state, config_snapshots=config_snapshots, manifest_checksum=manifest_checksum, environment=environment_report(device))
+        should_checkpoint = step % training_config.checkpoint_interval == 0 or step == target_steps
+        if should_checkpoint:
+            rank_rng_states = _gather_rank_rng_states(rank=rank, world_size=world_size)
+            if is_main_process and manager is not None:
+                assert rank_rng_states is not None
+                last_path = manager.save(
+                    step=step, validation_metric=average_loss, model=model,
+                    optimizer=optimizer, scheduler=scheduler, state=current_state,
+                    config_snapshots=config_snapshots,
+                    manifest_checksum=manifest_checksum,
+                    environment=environment_report(device),
+                    rank_rng_states=rank_rng_states,
+                    resolved_plan=config_snapshots.get("resolved_plan", {}),
+                )
         if world_size > 1 and torch.distributed.is_initialized(): torch.distributed.barrier()
     if is_main_process:
         assert last_path is not None

@@ -25,8 +25,19 @@ def lr_multiplier(step: int, config: TrainingConfig) -> float:
 def build_optimizer(
     parameters: Iterable[torch.nn.Parameter], config: TrainingConfig
 ) -> torch.optim.AdamW:
+    values = list(parameters)
+    kwargs = {
+        "lr": config.peak_lr,
+        "betas": (config.beta1, config.beta2),
+        "weight_decay": config.weight_decay,
+    }
+    if any(parameter.is_cuda for parameter in values):
+        try:
+            return torch.optim.AdamW(values, **kwargs, fused=True)
+        except (RuntimeError, TypeError):
+            pass
     return torch.optim.AdamW(
-        parameters,
+        values,
         lr=config.peak_lr,
         betas=(config.beta1, config.beta2),
         weight_decay=config.weight_decay,
