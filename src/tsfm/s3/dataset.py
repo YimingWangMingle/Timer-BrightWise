@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 from tsfm.data import normalize_context_target
+from tsfm.s3.finite_sampling import FiniteWindowIndex
 from tsfm.s3.records import ManifestRecord, SplitRegion
 from tsfm.s3.sampling import HierarchicalIndex
 from tsfm.s3.shards import read_segment_mmap
@@ -17,7 +18,7 @@ class S3WindowDataset(Dataset[dict[str, object]]):
         processed_root: str | Path,
         records: list[ManifestRecord],
         regions: list[SplitRegion],
-        hierarchy: HierarchicalIndex,
+        hierarchy: HierarchicalIndex | FiniteWindowIndex,
         patch_length: int = 96,
         context_patches: int = 30,
     ) -> None:
@@ -32,7 +33,7 @@ class S3WindowDataset(Dataset[dict[str, object]]):
             raise ValueError(f"sample_length must be {expected}")
 
     def __len__(self) -> int:
-        return 2**63 - 1
+        return getattr(self.hierarchy, "window_count", 2**63 - 1)
 
     def __getitem__(self, sample_index: int) -> dict[str, object]:
         key = self.hierarchy.sample(sample_index)
