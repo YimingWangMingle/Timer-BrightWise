@@ -33,6 +33,7 @@ def run_validated_training(
     config_snapshots: dict[str, object], device: torch.device,
     resume: str | Path | None = None, validation_batches: int = 4,
     rank: int = 0, world_size: int = 1, is_main_process: bool = True,
+    resolved_plan: dict[str, object] | None = None,
 ) -> TrainingReport:
     if set(validation_datasets) != {"val_heldout", "val_temporal"}:
         raise ValueError("both val_heldout and val_temporal datasets are required")
@@ -50,7 +51,7 @@ def run_validated_training(
     combined_losses: list[float] = []; total_micro = 0; total_optimizer = 0; final_report = None
     while current_step < training_config.total_steps:
         endpoint = min(current_step + training_config.validation_interval, training_config.total_steps)
-        report = run_training(model=model, dataset=train_dataset, training_config=training_config, output_dir=output, manifest_checksum=manifest_checksum, config_snapshots=config_snapshots, device=device, resume=current_resume, total_steps_override=endpoint, rank=rank, world_size=world_size, is_main_process=is_main_process)
+        report = run_training(model=model, dataset=train_dataset, training_config=training_config, output_dir=output, manifest_checksum=manifest_checksum, config_snapshots=config_snapshots, device=device, resume=current_resume, total_steps_override=endpoint, rank=rank, world_size=world_size, is_main_process=is_main_process, resolved_plan=resolved_plan)
         combined_losses.extend(report.losses); total_micro += report.micro_batches; total_optimizer += report.optimizer_steps
         current_step = endpoint; current_resume = output / f"step-{endpoint:06d}.pt"
         if world_size > 1 and torch.distributed.is_initialized(): torch.distributed.barrier()

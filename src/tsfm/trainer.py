@@ -22,6 +22,7 @@ from tsfm.checkpoint import (
     save_diagnostic,
 )
 from tsfm.optim import build_optimizer, build_scheduler
+from tsfm.s3.finite_sampling import AffineCoverageSampler
 from tsfm.s3.sampling import CounterSampler
 from tsfm.train_config import TrainingConfig
 
@@ -54,8 +55,48 @@ def _autocast(device: torch.device, precision: str):
     return contextlib.nullcontext()
 
 
-def _loader(dataset: Dataset, config: TrainingConfig, consumed: int, rank: int, world_size: int) -> DataLoader:
-    return DataLoader(dataset, batch_size=config.micro_batch_size, sampler=CounterSampler(consumed, rank, world_size), num_workers=config.num_workers, pin_memory=config.pin_memory, prefetch_factor=config.prefetch_factor, persistent_workers=config.num_workers > 0)
+def _loader(
+    dataset: Dataset,
+    config: TrainingConfig,
+    consumed: int,
+    rank: int,
+    world_size: int,
+    resolved_plan: dict[str, object] | None = None,
+) -> DataLoader:
+    if resolved_plan is None:
+        sampler = CounterSampler(consumed, rank, world_size)
+    else:
+        window_count = int(resolved_plan["window_count"])
+        cycles = int(resolved_plan["coverage_cycles"])
+        global_batch_size = int(resolved_plan["global_batch_size"])
+        planned_world_size = int(resolved_plan["world_size"])
+        if len(dataset) != window_count:
+            raise ValueError("finite dataset window count differs from resolved plan")
+        if world_size != planned_world_size:
+            raise ValueError("current world size differs from resolved plan")
+        actual_global_batch = (
+            config.micro_batch_size
+            * config.gradient_accumulation_steps
+            * world_size
+        )
+        if actual_global_batch != global_batch_size:
+            raise ValueError("training batch differs from resolved plan")
+        sampler = AffineCoverageSampler(
+            window_count=window_count,
+            cycles=cycles,
+            seed=int(resolved_plan["seed"]),
+            start_position=consumed,
+            rank=rank,
+            world_size=world_size,
+            global_batch_size=global_batch_size,
+        )
+        if sampler.total_real != int(resolved_plan["total_real_samples"]):
+            raise ValueError("resolved real sample count is inconsistent")
+        if sampler.total_padded != int(resolved_plan["total_padded_samples"]):
+            raise ValueError("resolved padded sample count is inconsistent")
+        if sampler.total_positions != int(resolved_plan["total_steps"]) * global_batch_size:
+            raise ValueError("resolved optimizer step count is inconsistent")
+    return DataLoader(dataset, batch_size=config.micro_batch_size, sampler=sampler, num_workers=config.num_workers, pin_memory=config.pin_memory, prefetch_factor=config.prefetch_factor, persistent_workers=config.num_workers > 0)
 
 
 def bounded_batch_probe(model: torch.nn.Module, batch: dict[str, object], device: torch.device, precision: str = "bf16") -> dict[str, float]:
@@ -91,7 +132,7 @@ def _gather_rank_rng_states(
     return {item_rank: state for item_rank, state in gathered}
 
 
-def run_training(*, model: torch.nn.Module, dataset: Dataset, training_config: TrainingConfig, output_dir: str | Path, manifest_checksum: str, config_snapshots: dict[str, object], device: torch.device, resume: str | Path | None = None, total_steps_override: int | None = None, rank: int = 0, world_size: int = 1, is_main_process: bool = True) -> TrainingReport:
+def run_training(*, model: torch.nn.Module, dataset: Dataset, training_config: TrainingConfig, output_dir: str | Path, manifest_checksum: str, config_snapshots: dict[str, object], device: torch.device, resume: str | Path | None = None, total_steps_override: int | None = None, rank: int = 0, world_size: int = 1, is_main_process: bool = True, resolved_plan: dict[str, object] | None = None) -> TrainingReport:
     target_steps = total_steps_override or training_config.total_steps
     if not 0 < target_steps <= training_config.total_steps: raise ValueError("requested steps must be within configured total_steps")
     output = Path(output_dir)
@@ -99,9 +140,19 @@ def run_training(*, model: torch.nn.Module, dataset: Dataset, training_config: T
     model = model.to(device); optimizer = build_optimizer(model.parameters(), training_config); scheduler = build_scheduler(optimizer, training_config)
     state = TrainingState(0, 0, {"next_sample": 0})
     if resume is not None:
-        state = load_training_checkpoint(resume, model=model, optimizer=optimizer, scheduler=scheduler, expected_config_snapshots=config_snapshots, expected_manifest_checksum=manifest_checksum)
+        state = load_training_checkpoint(
+            resume,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_config_snapshots=config_snapshots,
+            expected_manifest_checksum=manifest_checksum,
+            rank=rank,
+            expected_world_size=world_size,
+            expected_resolved_plan=resolved_plan,
+        )
     if state.global_step >= target_steps: raise ValueError("checkpoint is already at or beyond requested steps")
-    iterator = iter(_loader(dataset, training_config, state.consumed_samples, rank, world_size))
+    iterator = iter(_loader(dataset, training_config, state.consumed_samples, rank, world_size, resolved_plan))
     manager = CheckpointManager(output, keep_latest=2) if is_main_process else None
     losses: list[float] = []; source_counts: Counter[str] = Counter(); micro_batches = 0; last_path: Path | None = None; loss_dtype = ""; consumed = state.consumed_samples
     started = time.perf_counter(); model.train()
@@ -139,7 +190,7 @@ def run_training(*, model: torch.nn.Module, dataset: Dataset, training_config: T
                     manifest_checksum=manifest_checksum,
                     environment=environment_report(device),
                     rank_rng_states=rank_rng_states,
-                    resolved_plan=config_snapshots.get("resolved_plan", {}),
+                    resolved_plan=resolved_plan or {},
                 )
         if world_size > 1 and torch.distributed.is_initialized(): torch.distributed.barrier()
     if is_main_process:

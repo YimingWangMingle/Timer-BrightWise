@@ -172,6 +172,16 @@ class ResolvedTrainingPlan:
             precision=self.precision,
         )
 
+    @classmethod
+    def from_json(cls, path: str | Path) -> "ResolvedTrainingPlan":
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise ValueError("resolved training plan must be a JSON object")
+        plan = cls(**document)
+        if plan.to_dict() != document:
+            raise ValueError("resolved training plan is not canonical")
+        return plan
+
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
