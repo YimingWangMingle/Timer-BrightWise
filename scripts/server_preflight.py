@@ -15,8 +15,14 @@ def main() -> int:
     parser.add_argument("--persistent-root", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--expected-gpu", default="RTX 5090")
+    parser.add_argument("--expected-gpu-count", type=int, default=1)
+    parser.add_argument("--minimum-gpu-memory-bytes", type=int, default=0)
     args = parser.parse_args()
-    path = run_server_preflight(args.persistent_root, args.report_dir, args.expected_gpu)
+    path = run_server_preflight(
+        args.persistent_root, args.report_dir, args.expected_gpu,
+        expected_gpu_count=args.expected_gpu_count,
+        minimum_gpu_memory_bytes=args.minimum_gpu_memory_bytes,
+    )
     print(path)
     return 0
 
