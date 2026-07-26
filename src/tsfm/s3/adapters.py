@@ -23,6 +23,7 @@ class DatasetSpec:
     revision: str | None = None
     file_format: str | None = None
     data_files: tuple[str, ...] = ()
+    local_files: tuple[str, ...] = ()
 
 
 class _HuggingFaceAdapter:
@@ -48,7 +49,34 @@ class _HuggingFaceAdapter:
 
         return load_dataset
 
+    def _local_arrow_rows(self) -> Iterable[Mapping[str, Any]]:
+        if self.spec.file_format != "arrow":
+            raise ValueError(
+                f"{self.spec.source_id}/{self.spec.dataset_id}: "
+                "local files require file_format=arrow"
+            )
+        local_files = []
+        for value in self.spec.local_files:
+            path = Path(value)
+            if not path.is_absolute():
+                raise ValueError(f"local Arrow path is not absolute: {value}")
+            resolved = path.resolve()
+            if resolved.suffix != ".arrow" or not resolved.is_file():
+                raise ValueError(f"invalid local Arrow file: {resolved}")
+            local_files.append(str(resolved))
+        if not local_files:
+            raise ValueError(f"{self.spec.dataset_id}: no local Arrow files")
+        return self._dataset_loader()(
+            "arrow",
+            data_files={self.spec.split: local_files},
+            split=self.spec.split,
+            streaming=True,
+            cache_dir=self.cache_dir,
+        )
+
     def _rows(self) -> Iterable[Mapping[str, Any]]:
+        if self.spec.local_files:
+            return self._local_arrow_rows()
         return self._dataset_loader()(
             self.spec.repository,
             self.spec.configuration,

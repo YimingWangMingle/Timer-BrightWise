@@ -17,6 +17,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from tsfm.artifacts import verify_artifact_manifest
 from tsfm.s3.adapters import DatasetSpec, LOTSAAdapter, UTSDAdapter
 from tsfm.s3.manifest import load_manifest
 from tsfm.s3.segments import finite_univariate_segments
@@ -83,6 +84,9 @@ def _declared_entries(policy: dict) -> list[dict]:
                 raise ValueError(
                     f"{source['repository']}/{configuration}: domain is not declared"
                 )
+            mode = source.get("mode", "hub")
+            if mode not in {"hub", "local_arrow"}:
+                raise ValueError(f"unsupported dataset mode: {mode}")
             data_files = []
             if configured_files is not None:
                 data_files = configured_files.get(configuration, [])
@@ -95,6 +99,26 @@ def _declared_entries(policy: dict) -> list[dict]:
                         f"{source['repository']}/{configuration}: exact files require "
                         "revision and file_format"
                     )
+            if mode == "local_arrow":
+                local_path = source.get("local_path")
+                relative = Path(local_path) if isinstance(local_path, str) else None
+                if (
+                    relative is None
+                    or relative.is_absolute()
+                    or ".." in relative.parts
+                    or source.get("file_format") != "arrow"
+                ):
+                    raise ValueError(
+                        f"{source['repository']}/{configuration}: invalid local Arrow policy"
+                    )
+                if data_files:
+                    raise ValueError("local Arrow policy cannot declare remote data_files")
+                if not source.get("snapshot_revision"):
+                    raise ValueError("local Arrow policy requires snapshot_revision")
+                if int(source.get("expected_files", 0)) <= 0:
+                    raise ValueError("local Arrow policy requires expected_files")
+                if int(source.get("expected_bytes", 0)) <= 0:
+                    raise ValueError("local Arrow policy requires expected_bytes")
             entries.append(
                 {
                     "source_id": source["source_id"],
@@ -106,6 +130,11 @@ def _declared_entries(policy: dict) -> list[dict]:
                     "revision": source.get("revision"),
                     "file_format": source.get("file_format"),
                     "data_files": data_files,
+                    "mode": mode,
+                    "local_path": source.get("local_path"),
+                    "snapshot_revision": source.get("snapshot_revision"),
+                    "expected_files": source.get("expected_files"),
+                    "expected_bytes": source.get("expected_bytes"),
                 }
             )
     return entries
@@ -164,6 +193,7 @@ def build_inventory(
     endpoint: str,
     progress: Callable[[str], None],
     probe_file: FileProbe | None = None,
+    source_root: str | Path | None = None,
 ) -> dict:
     declared = _declared_entries(policy)
     entries = []
@@ -171,7 +201,29 @@ def build_inventory(
     for entry in declared:
         repository = entry["repository"]
         configuration = entry["configuration"]
-        if entry["data_files"]:
+        local_files: list[str] = []
+        source_manifest = None
+        if entry["mode"] == "local_arrow":
+            if source_root is None:
+                raise ValueError("source_root is required for local Arrow inventory")
+            resolved_source_root = Path(source_root).resolve()
+            snapshot = (resolved_source_root / entry["local_path"]).resolve()
+            if resolved_source_root != snapshot and resolved_source_root not in snapshot.parents:
+                raise ValueError(f"local snapshot escapes source_root: {snapshot}")
+            progress(f"verifying {entry['source_id']}/{repository}/{configuration}")
+            manifest = snapshot.parent / f"{snapshot.name}.sha256.json"
+            source_manifest = verify_artifact_manifest(
+                snapshot,
+                manifest,
+                expected_files=int(entry["expected_files"]),
+                expected_bytes=int(entry["expected_bytes"]),
+            )
+            arrow_paths = sorted(snapshot.glob("data-*.arrow"))
+            if not arrow_paths:
+                raise ValueError(f"no Arrow shards found in local snapshot: {snapshot}")
+            local_files = [str(path.resolve()) for path in arrow_paths]
+            estimated = _directory_bytes(snapshot)
+        elif entry["data_files"]:
             progress(f"probing {entry['source_id']}/{repository}/{configuration}")
             estimated = 0
             for file_spec in entry["data_files"]:
@@ -199,6 +251,8 @@ def build_inventory(
                 estimated += actual_size
         else:
             progress(f"discovering {entry['source_id']}/{repository}/{configuration}")
+            if load_builder is None:
+                raise ValueError("load_builder is required for Hub inventory")
             try:
                 builder = load_builder(repository, configuration, cache_dir=cache_dir)
             except Exception as error:
@@ -214,7 +268,14 @@ def build_inventory(
                 raise ValueError(
                     f"{repository}/{configuration}: metadata byte estimate is negative"
                 )
-        entries.append({**entry, "estimated_source_bytes": estimated})
+        entries.append(
+            {
+                **entry,
+                "estimated_source_bytes": estimated,
+                "local_files": local_files,
+                "source_manifest": source_manifest,
+            }
+        )
 
     projected = sum(entry["estimated_source_bytes"] for entry in entries)
     _validate_inventory_quotas(policy, entries, projected)
@@ -285,18 +346,30 @@ def build_validation_report(
 
 def discover(args: argparse.Namespace, policy: dict) -> None:
     paths = _guard(args)
-    from datasets import load_dataset_builder
+    local_only = all(
+        source.get("mode", "hub") == "local_arrow"
+        for source in policy["repositories"]
+    )
+    if local_only:
+        load_builder = None
+        hf_home = None
+        endpoint = ""
+        if args.source_root is None:
+            raise ValueError("source root is required for local Arrow discovery")
+    else:
+        from datasets import load_dataset_builder
 
-    hf_home = os.environ.get("HF_HOME")
-    if not hf_home:
-        raise ValueError("HF_HOME is required for server data discovery")
-    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+        hf_home = os.environ.get("HF_HOME")
+        if not hf_home:
+            raise ValueError("HF_HOME is required for server data discovery")
+        endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
     inventory = build_inventory(
         policy,
-        load_dataset_builder,
+        load_builder,
         hf_home,
         endpoint,
         lambda message: print(message, flush=True),
+        source_root=args.source_root,
     )
     inventory["policy_path"] = str(args.config.resolve())
     paths.data_root.mkdir(parents=True, exist_ok=True)
@@ -326,9 +399,17 @@ def convert(args: argparse.Namespace, policy: dict) -> None:
                 data_files=tuple(
                     file_spec["path"] for file_spec in entry.get("data_files", [])
                 ),
+                local_files=tuple(entry.get("local_files", [])),
             )
             adapter_type = UTSDAdapter if entry["source_id"] == "utsd" else LOTSAAdapter
-            adapter = adapter_type(spec, os.environ["HF_HOME"])
+            if spec.local_files:
+                cache_dir = paths.data_root / ".datasets-cache"
+            else:
+                hf_home = os.environ.get("HF_HOME")
+                if not hf_home:
+                    raise ValueError("HF_HOME is required for Hub conversion")
+                cache_dir = Path(hf_home)
+            adapter = adapter_type(spec, cache_dir)
             for series in adapter.iter_series():
                 yield from finite_univariate_segments(
                     series,
@@ -357,13 +438,20 @@ def validate(args: argparse.Namespace, policy: dict) -> None:
         if actual != record.checksum:
             raise ValueError(f"{record.record_id}: segment checksum mismatch")
 
-    hf_home = os.environ.get("HF_HOME")
-    if not hf_home:
-        raise ValueError("HF_HOME is required for server data validation")
+    local_only = all(
+        source.get("mode", "hub") == "local_arrow"
+        for source in policy["repositories"]
+    )
+    source_cache = args.source_root if local_only else os.environ.get("HF_HOME")
+    if not source_cache:
+        requirement = "source root" if local_only else "HF_HOME"
+        raise ValueError(f"{requirement} is required for server data validation")
     inventory = json.loads(
         (paths.data_root / "inventory.json").read_text(encoding="utf-8")
     )
-    report = build_validation_report(policy, inventory, records, hf_home, processed)
+    report = build_validation_report(
+        policy, inventory, records, source_cache, processed
+    )
     report["manifest_checksum"] = expected
     _atomic_json(paths.data_root / "conversion-report.json", report)
     print(json.dumps(report, sort_keys=True))
@@ -381,6 +469,11 @@ def parse_args() -> argparse.Namespace:
         "--persistent-root", type=Path, default=os.getenv("TSFM_PERSISTENT_ROOT")
     )
     parser.add_argument("--data-root", type=Path, default=os.getenv("TSFM_DATA_ROOT"))
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=os.getenv("TSFM_SOURCE_ROOT") or os.getenv("TSFM_DATA_ROOT"),
+    )
     parser.add_argument("--execute-server", action="store_true")
     return parser.parse_args()
 

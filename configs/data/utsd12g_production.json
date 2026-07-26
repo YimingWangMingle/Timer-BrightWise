@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "seed": 2026,
+  "repositories": [
+    {
+      "source_id": "utsd",
+      "repository": "thuml/UTSD",
+      "snapshot_revision": "7326ff5f4578da73d843fd675d760c6c6054017f",
+      "mode": "local_arrow",
+      "local_path": "raw/utsd/UTSD-12G",
+      "file_format": "arrow",
+      "expected_files": 82,
+      "expected_bytes": 3892126910,
+      "configurations": ["UTSD-12G"],
+      "domains": {
+        "UTSD-12G": "mixed-utsd"
+      },
+      "split": "train"
+    }
+  ],
+  "selection": {
+    "minimum_dataset_groups_by_source": {
+      "utsd": 1
+    },
+    "minimum_domain_groups": 1,
+    "maximum_source_cache_bytes": 20000000000,
+    "maximum_processed_bytes": 20000000000,
+    "minimum_segment_length": 2976,
+    "minimum_variance": 1e-8,
+    "maximum_shard_bytes": 2000000000
+  }
+}
