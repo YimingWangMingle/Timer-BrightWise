@@ -9,4 +9,8 @@ data/
 *.pt
 *.pth
 *.safetensors
+*.sha256.json
+*.tar.zst
+runtime-bundles/
+wheelhouse/
 
