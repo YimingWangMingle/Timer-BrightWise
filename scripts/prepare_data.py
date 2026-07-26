@@ -18,6 +18,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from tsfm.artifacts import verify_artifact_manifest
+from tsfm.conversion_state import (
+    ConversionBinding,
+    begin_conversion,
+    publish_conversion,
+    validate_completed_conversion,
+)
 from tsfm.s3.adapters import DatasetSpec, LOTSAAdapter, UTSDAdapter
 from tsfm.s3.manifest import load_manifest
 from tsfm.s3.segments import finite_univariate_segments
@@ -40,6 +46,14 @@ def _directory_bytes(path: Path) -> int:
     if not path.exists():
         return 0
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _load_policy(path: Path) -> dict:
@@ -385,6 +399,18 @@ def convert(args: argparse.Namespace, policy: dict) -> None:
     _validate_inventory_quotas(
         policy, selected, int(inventory["projected_source_bytes"])
     )
+    local_only = all(
+        source.get("mode", "hub") == "local_arrow"
+        for source in policy["repositories"]
+    )
+    if local_only:
+        if len(selected) != 1 or not selected[0].get("source_manifest"):
+            raise ValueError("local production inventory has no unique source manifest")
+        final_processed = paths.data_root / "processed" / "utsd-12g"
+        processed = begin_conversion(final_processed)
+    else:
+        final_processed = paths.data_root / "processed"
+        processed = final_processed
 
     def segments():
         for entry in selected:
@@ -417,18 +443,47 @@ def convert(args: argparse.Namespace, policy: dict) -> None:
                     policy["selection"]["minimum_variance"],
                 )
 
-    processed = paths.data_root / "processed"
     records, digest = pack_segments(
         segments(), processed, policy["selection"]["maximum_shard_bytes"]
     )
     (processed / "manifest.sha256").write_text(digest + "\n", encoding="ascii")
-    print(f"converted {len(records)} finite segments; manifest={digest}")
+    if local_only:
+        binding = ConversionBinding(
+            source_manifest=selected[0]["source_manifest"],
+            processed_manifest=digest,
+            policy_digest=_file_sha256(args.config),
+            records=len(records),
+            processed_bytes=_directory_bytes(processed),
+        )
+        publish_conversion(processed, final_processed, binding)
+    print(
+        f"converted {len(records)} finite segments; manifest={digest}; "
+        f"root={final_processed}"
+    )
 
 
 def validate(args: argparse.Namespace, policy: dict) -> None:
     paths = _guard(args)
-    processed = paths.data_root / "processed"
-    expected = (processed / "manifest.sha256").read_text(encoding="ascii").strip()
+    inventory = json.loads(
+        (paths.data_root / "inventory.json").read_text(encoding="utf-8")
+    )
+    local_only = all(
+        source.get("mode", "hub") == "local_arrow"
+        for source in policy["repositories"]
+    )
+    if local_only:
+        processed = paths.data_root / "processed" / "utsd-12g"
+        if len(inventory["selected"]) != 1:
+            raise ValueError("local production inventory must contain one dataset")
+        binding = validate_completed_conversion(
+            processed,
+            source_manifest=inventory["selected"][0]["source_manifest"],
+            policy_digest=_file_sha256(args.config),
+        )
+        expected = binding.processed_manifest
+    else:
+        processed = paths.data_root / "processed"
+        expected = (processed / "manifest.sha256").read_text(encoding="ascii").strip()
     records = load_manifest(processed / "manifest.jsonl", expected)
     for record in records:
         values = read_segment_mmap(processed, record)
@@ -438,17 +493,10 @@ def validate(args: argparse.Namespace, policy: dict) -> None:
         if actual != record.checksum:
             raise ValueError(f"{record.record_id}: segment checksum mismatch")
 
-    local_only = all(
-        source.get("mode", "hub") == "local_arrow"
-        for source in policy["repositories"]
-    )
     source_cache = args.source_root if local_only else os.environ.get("HF_HOME")
     if not source_cache:
         requirement = "source root" if local_only else "HF_HOME"
         raise ValueError(f"{requirement} is required for server data validation")
-    inventory = json.loads(
-        (paths.data_root / "inventory.json").read_text(encoding="utf-8")
-    )
     report = build_validation_report(
         policy, inventory, records, source_cache, processed
     )
