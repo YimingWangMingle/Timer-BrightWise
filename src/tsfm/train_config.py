@@ -19,6 +19,7 @@ class TrainingConfig:
     gradient_clip: float = 1.0
     validation_interval: int = 250
     checkpoint_interval: int = 250
+    logging_interval: int = 10
     seed: int = 2026
     num_workers: int = 8
     prefetch_factor: int = 2
@@ -35,10 +36,10 @@ class TrainingConfig:
             raise ValueError("peak_lr must be positive")
         if not 0 < self.minimum_lr_ratio <= 1:
             raise ValueError("minimum_lr_ratio must be in (0, 1]")
-        if self.validation_interval <= 0 or self.total_steps % self.validation_interval:
-            raise ValueError("validation_interval must divide total_steps")
-        if self.checkpoint_interval <= 0 or self.total_steps % self.checkpoint_interval:
-            raise ValueError("checkpoint_interval must divide total_steps")
+        if self.validation_interval <= 0:
+            raise ValueError("validation_interval must be positive")
+        if self.checkpoint_interval <= 0:
+            raise ValueError("checkpoint_interval must be positive")
         if min(
             self.micro_batch_size,
             self.gradient_accumulation_steps,
@@ -46,6 +47,7 @@ class TrainingConfig:
             self.num_workers,
             self.prefetch_factor,
             self.context_patches,
+            self.logging_interval,
         ) <= 0:
             raise ValueError("batch, loader, context, and clipping values must be positive")
         if self.precision != "bf16":

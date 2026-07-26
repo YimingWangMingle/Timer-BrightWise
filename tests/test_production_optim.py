@@ -47,12 +47,12 @@ def test_optimizer_and_schedule_match_approved_values() -> None:
     assert lr_multiplier(99, config) == pytest.approx(0.1)
 
 
-def test_training_config_rejects_non_divisible_intervals() -> None:
+def test_training_config_rejects_nonpositive_intervals() -> None:
     with pytest.raises(ValueError, match="validation_interval"):
         TrainingConfig(
             total_steps=501,
             warmup_steps=50,
             peak_lr=2e-4,
-            validation_interval=250,
+            validation_interval=0,
             checkpoint_interval=167,
         )
