@@ -1,5 +1,10 @@
 # Server Validation Runbook
 
+This file preserves the RTX 5090 validation workflow as engineering evidence.
+Formal four-H100 307M production must use
+`docs/h100-307m-runbook.md`. The H20 16-card section below is legacy
+preflight-only and is not the current production recipe.
+
 ## 1. Local Gate
 
 Do not download UTSD, LOTSA, model weights, or formal checkpoints locally.
