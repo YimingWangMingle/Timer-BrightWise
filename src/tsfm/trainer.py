@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import platform
@@ -118,18 +119,39 @@ def _distributed_mean(value: float, device: torch.device, world_size: int) -> fl
     return float(tensor / world_size)
 
 
+def _serialize_rng_state(state: dict[str, object]) -> bytes:
+    buffer = io.BytesIO()
+    torch.save(state, buffer)
+    return buffer.getvalue()
+
+
+def _deserialize_rng_state(payload: bytes) -> dict[str, object]:
+    state = torch.load(
+        io.BytesIO(payload), map_location="cpu", weights_only=True
+    )
+    if not isinstance(state, dict):
+        raise TypeError("serialized RNG state must contain a dictionary")
+    return state
+
+
 def _gather_rank_rng_states(
     *, rank: int, world_size: int
 ) -> dict[int, dict[str, object]] | None:
     local = capture_rng_state()
     if world_size == 1 or not torch.distributed.is_initialized():
         return {rank: local}
+    payload = _serialize_rng_state(local)
     gathered = [None] * world_size if rank == 0 else None
-    torch.distributed.gather_object((rank, local), gathered, dst=0)
+    torch.distributed.gather_object((rank, payload), gathered, dst=0)
     if rank != 0:
         return None
     assert gathered is not None
-    return {item_rank: state for item_rank, state in gathered}
+    states: dict[int, dict[str, object]] = {}
+    for item in gathered:
+        assert item is not None
+        item_rank, item_payload = item
+        states[item_rank] = _deserialize_rng_state(item_payload)
+    return states
 
 
 def run_training(*, model: torch.nn.Module, dataset: Dataset, training_config: TrainingConfig, output_dir: str | Path, manifest_checksum: str, config_snapshots: dict[str, object], device: torch.device, resume: str | Path | None = None, total_steps_override: int | None = None, rank: int = 0, world_size: int = 1, is_main_process: bool = True, resolved_plan: dict[str, object] | None = None) -> TrainingReport:
